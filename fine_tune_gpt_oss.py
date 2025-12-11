@@ -8,25 +8,15 @@ from torch.utils.data import DataLoader
 
 os.environ["TRANSFORMERS_NO_TF"] = "1"
 os.environ["TRANSFORMERS_NO_FLAX"] = "1"
+import torch.nn.functional as F
+import prompt.prompt as train_prompt
 
 def parser():
     parser = argparse.ArgumentParser(description='lllm_args')
     parser.add_argument('--process_name', '-pn', type=str, default='load_pdf', help='process name')
-    parser.add_argument('--patent_path', '-ip', type=str, default='../data/☆特開2014-208842.pdf', help='path to image')
-    parser.add_argument('--video_path', '-vp', type=str, default='video/sample_01.mov', help='path to image')
     parser.add_argument('--output_dir', '-od', type=str, default='../debug/', help='path to output directory')
     parser.add_argument('--input_dir', '-id', type=str, default='src_nitto_csv', help='path to input directory')
-    parser.add_argument('--event_num', '-en', type=int, default=3, help='the number of event which correspond to the number of ask to llm')
-    parser.add_argument('--csv_name', '-cn', type=str, default='', help='csv file name to deal with. ex) KAN_RA_RiskList_20250117155008.csv')
-    parser.add_argument('--prompt_type', '-pt', type=str, default='base_info', help='prompt type. base_info, experiment_table, ...else')
-    parser.add_argument('--init_page', '-ipg', type=int, default=0, help='the initial page number in patent to ask to llm')
-    parser.add_argument('--outcsv_dir', '-ocd', type=str, default='../csv_out/', help='path to output csv directory')
-    parser.add_argument('--outjson_dir', '-ojd', type=str, default='../json_out/', help='path to output json directory')
-    parser.add_argument('--all_pdf', '-apf', default=False, action='store_true', help='infer all pdf')
-    parser.add_argument('--pdf_resolution', '-prl', type=float, default=2.0, help='dpi at converting pdf to image')
-    parser.add_argument('--use_ocr', '-uor', default=False, action='store_true', help='use ocr')
-    parser.add_argument('--table_format', '-tft', default=False, action='store_true', help='table format for base info')
-
+    parser.add_argument('--text_type', '-tt', type=str, default='ehime', help='text type used for training')
     return parser.parse_args()
 
 def download_models():
@@ -39,6 +29,7 @@ def download_models():
         max_seq_length = max_seq_length,
         load_in_4bit = True,  # downloadされるモデルはfp16だが、ここで4bitに替えられる
         full_finetuning = False,
+        # cache_dir = "./hf_cache",
     )
 
 def predict(args):
@@ -50,26 +41,13 @@ def predict(args):
         dtype = dtype,
         max_seq_length = max_seq_length,
         load_in_4bit = True,  # 4bit
+        # load_in_8bit = True,  # 8bit
         full_finetuning = False,
     )
-
-    # fine-tuneの設定
-    model = FastLanguageModel.get_peft_model( # peft: Parameter-Efficient Fine-Tuning
-        model,
-        r = 8,  # （8, 16, 32, 64, 128）
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"],
-        lora_alpha = 16,
-        lora_dropout = 0,
-        bias = "none",
-        use_gradient_checkpointing = "unsloth",  # 30%少ないVRAM使用
-        random_state = 3407,
-        use_rslora = False,
-        loftq_config = None,
-    )
+    print("tokenizer ", tokenizer)
 
     messages = [
-    {"role": "user", "content": "x^5 + 3x^4 - 10 = 3を解いてください。"},
+    {"role": "user", "content": "{}".format(train_prompt.get_train_text(args.text_type))},
     ]
 
     # 推論努力レベルを設定（low/medium/high）
@@ -81,9 +59,28 @@ def predict(args):
         reasoning_effort = "medium",  # ここで設定！
     ).to(model.device)
 
-    output_ids = model.generate(**inputs, max_new_tokens = 1024, streamer = TextStreamer(tokenizer))
+    output_ids = model.generate(
+                                **inputs,
+                                max_new_tokens = 1024,
+                                streamer = TextStreamer(tokenizer))
     print("output_ids", output_ids)
     print(tokenizer.decode(output_ids[0]))
+
+
+def get_lora_norms(model):
+    stats = {}
+    for name, p in model.named_parameters():
+        if "lora" in name and p.requires_grad:
+            stats[name] = p.detach().norm().item()
+    return stats
+
+def get_lora_deltas(model, initial_lora):
+    deltas = {}
+    for name, p in model.named_parameters():
+        if name in initial_lora:
+            delta = (p.detach() - initial_lora[name])
+            deltas[name] = delta.norm().item()
+    return deltas
 
 
 def train_simple_lora(args):
@@ -117,10 +114,10 @@ def train_simple_lora(args):
     model = model.to(dtype)
 
     # train_text = "ユーザー: 2+2は？\nアシスタント: 4です。"
-    train_text = "ユーザー: 2025年9月以降の日本の首都は？\nアシスタント: 愛媛県伊予郡松前町です。"
+    train_text = train_prompt.get_train_text(args.text_type)
 
     # tokenizerで直接変換
-    inputs = tokenizer(
+    inputs = tokenizer( # 
         train_text,
         return_tensors="pt",
         max_length=1024,
@@ -138,6 +135,15 @@ def train_simple_lora(args):
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     model.train()
 
+    # 学習開始前にloraの学習parameter名を記録
+    initial_lora = {
+        name: p.detach().clone()
+        for name, p in model.named_parameters()
+        if "lora" in name and p.requires_grad
+    }
+
+    lora_norm_history = []  # 各 epoch ごとに dict を append
+
     print("=== LoRAによる学習開始 ===")
     for epoch in range(30):  # 簡易的に1エポックのみ
         for input_ids, attention_mask, labels in loader:
@@ -151,6 +157,7 @@ def train_simple_lora(args):
             optimizer.step()
             optimizer.zero_grad()
             print(f"epoch:{epoch+1}. loss = {loss.item():.4f}")
+            lora_norm_history.append(get_lora_norms(model))
     print("=== 学習完了 ===")
 
     # ==== 学習済みモデルで推論 ====
@@ -179,7 +186,10 @@ if __name__ == "__main__":
     python3  fine_tune_gpt_oss.py --process_name download_models
 
     2) predict model
-    python3 fine_tune_gpt_oss.py --process_name do_fine_tune
+    python3 fine_tune_gpt_oss.py --process_name predict --text_type math_tanzent
+
+    3) train lora
+    python3 fine_tune_gpt_oss.py --process_name train_lora --text_type simultaneous equations
     """
     args = parser()
     if args.process_name == 'download_models':
