@@ -128,7 +128,8 @@ def train_simple_lora(args):
     labels = inputs["input_ids"].clone()
 
     # DataLoaderを構築
-    dataset = [(inputs["input_ids"].squeeze(0), inputs["attention_mask"].squeeze(0), labels.squeeze(0))]
+    dataset = [(inputs["input_ids"].squeeze(0), 
+                inputs["attention_mask"].squeeze(0), labels.squeeze(0))]
     loader = DataLoader(dataset, batch_size=1, shuffle=True)
 
     # ==== 学習設定 ====
